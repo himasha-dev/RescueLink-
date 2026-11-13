@@ -933,4 +933,80 @@ public class MainActivity extends Activity {
         .show();
   }
 
+  private void accountsScreen() {
+    screen = "accounts";
+    shell("Administrator • account approvals");
+    button(body, "Back", this::home);
+    for (String u : ids("u.", ".role")) {
+      text(
+          body,
+          u
+              + " • "
+              + data.getProperty("u." + u + ".role")
+              + " • "
+              + (data.getProperty("u." + u + ".approved").equals("true") ? "approved" : "PENDING"),
+          16);
+      if (!data.getProperty("u." + u + ".approved").equals("true"))
+        button(body, "Approve " + u, () -> mutation("approve", "username", u));
+    }
+    button(body, "Refresh", this::accountsScreen);
+  }
+
+  protected void onActivityResult(int request, int result, Intent intent) {
+    super.onActivityResult(request, result, intent);
+    if (result != RESULT_OK || intent == null) return;
+    if (request == 201) {
+      selectedLat = intent.getDoubleExtra("lat", selectedLat);
+      selectedLon = intent.getDoubleExtra("lon", selectedLon);
+      locationSelected = true;
+      if (screen.equals("home")) renderHome();
+      if (locationLabel != null)
+        locationLabel.setText("Selected: " + selectedLat + ", " + selectedLon);
+    }
+    if (request == 202 && intent.getData() != null) {
+      android.net.Uri uri = intent.getData();
+      background(
+          () -> {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+              BitmapFactory.decodeStream(in, null, bounds);
+            }
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0)
+              throw new Exception("Cannot read photo");
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = 1;
+            while (Math.max(bounds.outWidth, bounds.outHeight) / opts.inSampleSize > 1280)
+              opts.inSampleSize *= 2;
+            Bitmap bitmap;
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+              bitmap = BitmapFactory.decodeStream(in, null, opts);
+            }
+            if (bitmap == null) throw new Exception("Cannot decode photo");
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            int quality = 80;
+            do {
+              out.reset();
+              bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out);
+              quality -= 10;
+            } while (out.size() > 512000 && quality >= 30);
+            bitmap.recycle();
+            if (out.size() > 512000)
+              throw new Exception("Photo still too large; select a smaller image");
+            String encoded =
+                android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP);
+            runOnUiThread(
+                () -> {
+                  photo = encoded;
+                  if (photoLabel != null)
+                    photoLabel.setText("Photo attached • " + out.size() / 1024 + " KB");
+                });
+          });
+    }
+  }
+
+  public void onBackPressed() {
+    if (session != null && !screen.equals("home")) home();
+    else super.onBackPressed();
+  }
 }
