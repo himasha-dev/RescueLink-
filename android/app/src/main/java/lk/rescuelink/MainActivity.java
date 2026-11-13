@@ -864,4 +864,73 @@ public class MainActivity extends Activity {
         .show();
   }
 
+  private void resourcesScreen() {
+    screen = "resources";
+    shell("Resources & capacities");
+    button(body, "Back", this::home);
+    for (String r : ids("r.", ".name")) {
+      text(
+          body,
+          data.getProperty("r." + r + ".name")
+              + " • "
+              + data.getProperty("r." + r + ".type")
+              + "\nOwner: "
+              + data.getProperty("r." + r + ".owner")
+              + " • Available "
+              + data.getProperty("r." + r + ".available")
+              + " / "
+              + data.getProperty("r." + r + ".total"),
+          16);
+      if (session.role.equals("ADMIN")
+          || session.user.equals(data.getProperty("r." + r + ".owner")))
+        button(body, "Edit capacity", () -> resourceDialog(r));
+    }
+    if (Arrays.asList("ADMIN", "RESCUE", "HOSPITAL").contains(session.role))
+      button(body, "Add resource", () -> resourceDialog(""));
+    button(body, "Refresh", this::resourcesScreen);
+  }
+
+  private void resourceDialog(String id) {
+    LinearLayout box = new LinearLayout(this);
+    box.setOrientation(LinearLayout.VERTICAL);
+    box.setPadding(dp(16), 0, dp(16), 0);
+    EditText name = edit(box, "Resource name");
+    Spinner type = spinner(box, "AMBULANCE", "VEHICLE", "RESPONDER", "BED", "EQUIPMENT");
+    EditText owner = edit(box, "Approved rescue/hospital username");
+    owner.setText(session.role.equals("ADMIN") ? "" : session.user);
+    EditText total = edit(box, "Total capacity");
+    total.setInputType(InputType.TYPE_CLASS_NUMBER);
+    total.setText("1");
+    if (!id.isEmpty()) {
+      name.setText(data.getProperty("r." + id + ".name"));
+      owner.setText(data.getProperty("r." + id + ".owner"));
+      owner.setEnabled(false);
+      total.setText(data.getProperty("r." + id + ".total"));
+      String t = data.getProperty("r." + id + ".type");
+      for (int n = 0; n < type.getCount(); n++)
+        if (type.getItemAtPosition(n).equals(t)) type.setSelection(n);
+      type.setEnabled(false);
+    } else if (session.role.equals("HOSPITAL")) type.setSelection(3);
+    new AlertDialog.Builder(this)
+        .setTitle("Resource details")
+        .setView(box)
+        .setPositiveButton(
+            "Save",
+            (d, w) ->
+                mutation(
+                    "resource",
+                    "id",
+                    id,
+                    "name",
+                    value(name),
+                    "type",
+                    choice(type),
+                    "owner",
+                    value(owner),
+                    "total",
+                    value(total)))
+        .setNegativeButton("Cancel", null)
+        .show();
+  }
+
 }
