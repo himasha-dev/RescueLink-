@@ -280,4 +280,217 @@ public final class Server implements AutoCloseable {
     return digest(b.toString());
   }
 
+  private Properties mutate(String u, Properties p) throws IOException {
+    String op = required(p, "op"), req = required(p, "request");
+    need(req.matches("[A-Za-z0-9-]{8,64}"), "Invalid request ID");
+    String key = "q." + u + "." + req + ".";
+    String hash = requestHash(p);
+    if (state.containsKey(key + "hash")) {
+      need(
+          state.getProperty(key + "hash").equals(hash), "Request ID reused with different content");
+      return props(
+          "ok",
+          "true",
+          "id",
+          state.getProperty(key + "id", ""),
+          "revision",
+          String.valueOf(revision),
+          "duplicate",
+          "true");
+    }
+    Properties before = (Properties) state.clone();
+    long oldRevision = revision;
+    try {
+      String id = p.getProperty("id", "");
+      String base = "i." + id + ".";
+      switch (op) {
+        case "report" -> {
+          roleRequired(u, "CITIZEN");
+          coordinates(p);
+          String type = field(p, "type", 40), severity = required(p, "severity");
+          need(Set.of("LOW", "MEDIUM", "HIGH", "CRITICAL").contains(severity), "Invalid severity");
+          String description = p.getProperty("description", "").trim();
+          need(description.length() <= 1000, "Description too long");
+          boolean sos = Boolean.parseBoolean(p.getProperty("sos", "false"));
+          need(sos || !description.isEmpty(), "Description required for ordinary reports");
+          need(ids("i.", ".owner").size() < 2000, "Demo incident capacity reached");
+          id = UUID.randomUUID().toString();
+          base = "i." + id + ".";
+          for (String k : List.of("lat", "lon")) state.setProperty(base + k, p.getProperty(k));
+          state.setProperty(base + "owner", u);
+          state.setProperty(base + "type", type);
+          state.setProperty(base + "severity", severity);
+          state.setProperty(base + "description", description);
+          state.setProperty(base + "sos", String.valueOf(sos));
+          state.setProperty(base + "status", "REPORTED");
+          state.setProperty(base + "created", Instant.now().toString());
+          String photo = p.getProperty("photo", "");
+          if (!photo.isEmpty()) {
+            byte[] image;
+            try {
+              image = Base64.getDecoder().decode(photo);
+            } catch (Exception e) {
+              throw new Bad(400, "Invalid photo");
+            }
+            need(
+                image.length <= 512000
+                    && image.length >= 3
+                    && image[0] == (byte) 0xff
+                    && image[1] == (byte) 0xd8
+                    && image[2] == (byte) 0xff,
+                "Photo must be JPEG, max 500 KB");
+            state.setProperty(base + "photo", photo);
+          }
+        }
+        case "chat" -> {
+          incidentAccess(u, id);
+          String message = field(p, "message", 1000);
+          need(!state.getProperty(base + "status").equals("RESOLVED"), "Incident resolved");
+          int n = Integer.parseInt(state.getProperty(base + "chatCount", "0"));
+          need(n < 500, "Demo chat capacity reached");
+          String m = base + "chat." + String.format(Locale.ROOT, "%04d", n) + ".";
+          state.setProperty(m + "user", u);
+          state.setProperty(m + "text", message);
+          state.setProperty(m + "time", Instant.now().toString());
+          state.setProperty(base + "chatCount", String.valueOf(n + 1));
+        }
+        case "ack" -> {
+          roleRequired(u, "DISPATCHER", "ADMIN");
+          incidentAccess(u, id);
+          need(state.getProperty(base + "status").equals("REPORTED"), "Already acknowledged");
+          state.setProperty(base + "status", "ACKNOWLEDGED");
+          state.setProperty(base + "ackBy", u);
+        }
+        case "assign" -> {
+          incidentAccess(u, id);
+          String rid = required(p, "resource");
+          need(state.containsKey("r." + rid + ".name"), "Unknown resource");
+          String type = state.getProperty("r." + rid + ".type"),
+              owner = state.getProperty("r." + rid + ".owner");
+          boolean own = u.equals(owner);
+          boolean dispatch =
+              role(u).equals("ADMIN") || role(u).equals("DISPATCHER") && !type.equals("BED");
+          if (!(dispatch
+              || own && role(u).equals("HOSPITAL") && type.equals("BED")
+              || own && role(u).equals("RESCUE") && type.equals("EQUIPMENT")))
+            throw new Bad(403, "Resource assignment denied");
+          String status = state.getProperty(base + "status");
+          need(
+              !Set.of("REPORTED", "RESOLVED").contains(status),
+              "Acknowledge incident before allocation");
+          need(
+              !state.containsKey(base + "allocation." + rid + ".quantity"),
+              "Resource already allocated to this incident");
+          int quantity = integer(p, "quantity", 1, 10000);
+          need(
+              quantity <= Integer.parseInt(state.getProperty("r." + rid + ".total")) - used(rid),
+              "Insufficient available resources");
+          state.setProperty(base + "allocation." + rid + ".quantity", String.valueOf(quantity));
+          state.setProperty(base + "allocation." + rid + ".accepted", "false");
+          if (status.equals("ACKNOWLEDGED")) state.setProperty(base + "status", "ASSIGNED");
+        }
+        case "accept" -> {
+          roleRequired(u, "RESCUE", "HOSPITAL");
+          incidentAccess(u, id);
+          need(!state.getProperty(base + "status").equals("RESOLVED"), "Incident resolved");
+          String rid = required(p, "resource");
+          need(
+              u.equals(state.getProperty("r." + rid + ".owner")),
+              "Only the resource owner can accept");
+          need(state.containsKey(base + "allocation." + rid + ".quantity"), "Not assigned");
+          state.setProperty(base + "allocation." + rid + ".accepted", "true");
+          if (state.getProperty(base + "status").equals("ASSIGNED"))
+            state.setProperty(base + "status", "ACCEPTED");
+        }
+        case "progress" -> {
+          roleRequired(u, "RESCUE", "HOSPITAL");
+          incidentAccess(u, id);
+          boolean accepted = false;
+          for (String r : allocations(id))
+            if (u.equals(state.getProperty("r." + r + ".owner"))
+                && state.getProperty(base + "allocation." + r + ".accepted").equals("true"))
+              accepted = true;
+          need(accepted, "Accept your assignment first");
+          String next = required(p, "status"), old = state.getProperty(base + "status");
+          need(
+              next.equals("EN_ROUTE") && old.equals("ACCEPTED")
+                  || next.equals("ON_SCENE") && Set.of("ACCEPTED", "EN_ROUTE").contains(old),
+              "Invalid progress transition");
+          state.setProperty(base + "status", next);
+        }
+        case "resolve" -> {
+          roleRequired(u, "DISPATCHER", "ADMIN");
+          incidentAccess(u, id);
+          need(
+              !Set.of("REPORTED", "RESOLVED").contains(state.getProperty(base + "status")),
+              "Cannot resolve this state");
+          state.setProperty(base + "status", "RESOLVED");
+          state.setProperty(base + "resolvedBy", u);
+        }
+        case "location" -> {
+          roleRequired(u, "CITIZEN");
+          incidentAccess(u, id);
+          need(u.equals(state.getProperty(base + "owner")), "Only reporter can update location");
+          need(!state.getProperty(base + "status").equals("RESOLVED"), "Incident resolved");
+          coordinates(p);
+          state.setProperty(base + "lat", p.getProperty("lat"));
+          state.setProperty(base + "lon", p.getProperty("lon"));
+          state.setProperty(base + "locationTime", Instant.now().toString());
+        }
+        case "approve" -> {
+          roleRequired(u, "ADMIN");
+          String name = userName(required(p, "username"));
+          need(state.containsKey("u." + name + ".role"), "Unknown account");
+          state.setProperty("u." + name + ".approved", "true");
+        }
+        case "resource" -> {
+          roleRequired(u, "ADMIN", "RESCUE", "HOSPITAL");
+          String type = required(p, "type");
+          need(TYPES.contains(type), "Invalid resource type");
+          String owner = userName(required(p, "owner"));
+          need(
+              Boolean.parseBoolean(state.getProperty("u." + owner + ".approved", "false")),
+              "Resource owner must be approved");
+          need(
+              Set.of("RESCUE", "HOSPITAL").contains(role(owner)),
+              "Owner must be rescue team or hospital");
+          if (type.equals("BED"))
+            need(role(owner).equals("HOSPITAL"), "Beds need a hospital owner");
+          else need(role(owner).equals("RESCUE"), "Other resources need a rescue owner");
+          if (!role(u).equals("ADMIN")) need(u.equals(owner), "You can manage only your resources");
+          if (id.isEmpty()) id = UUID.randomUUID().toString();
+          else {
+            need(state.containsKey("r." + id + ".name"), "Unknown resource");
+            need(
+                owner.equals(state.getProperty("r." + id + ".owner"))
+                    && type.equals(state.getProperty("r." + id + ".type")),
+                "Cannot change owner or type");
+          }
+          int total = integer(p, "total", 0, 10000);
+          need(total >= used(id), "Total cannot be below allocated quantity");
+          state.setProperty("r." + id + ".name", field(p, "name", 100));
+          state.setProperty("r." + id + ".type", type);
+          state.setProperty("r." + id + ".owner", owner);
+          state.setProperty("r." + id + ".total", String.valueOf(total));
+        }
+        default -> throw new Bad(400, "Unknown operation");
+      }
+      // Frequent location samples are overwrite-only and need no durable dedup record.
+      if (!op.equals("location")) {
+        state.setProperty(key + "hash", hash);
+        state.setProperty(key + "id", id);
+      }
+      revision++;
+      state.setProperty("revision", String.valueOf(revision));
+      save();
+      notifyAll();
+      return props("ok", "true", "id", id, "revision", String.valueOf(revision));
+    } catch (Exception e) {
+      state.clear();
+      state.putAll(before);
+      revision = oldRevision;
+      throw e;
+    }
+  }
+
 }
