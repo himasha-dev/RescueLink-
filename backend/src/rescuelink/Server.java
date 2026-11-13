@@ -493,4 +493,191 @@ public final class Server implements AutoCloseable {
     }
   }
 
+  private static int integer(Properties p, String k, int min, int max) {
+    try {
+      int n = Integer.parseInt(required(p, k));
+      need(n >= min && n <= max, "Invalid " + k);
+      return n;
+    } catch (NumberFormatException e) {
+      throw new Bad(400, "Invalid " + k);
+    }
+  }
+
+  private void rateLimit(String key) {
+    long now = System.currentTimeMillis();
+    long[] b = attempts.computeIfAbsent(key, k -> new long[] {now, 0});
+    synchronized (b) {
+      if (now - b[0] > 60000) {
+        b[0] = now;
+        b[1] = 0;
+      }
+      if (++b[1] > 15) throw new Bad(429, "Too many authentication attempts; wait one minute");
+    }
+    if (attempts.size() > 10000) attempts.entrySet().removeIf(e -> now - e.getValue()[0] > 120000);
+  }
+
+  private Properties request(Properties p, String ip) throws Exception {
+    String op = required(p, "op");
+    if (Set.of("login", "register").contains(op)) {
+      String u = userName(required(p, "username"));
+      rateLimit(ip + ":" + u);
+      synchronized (this) {
+        Properties before = (Properties) state.clone();
+        long oldRevision = revision;
+        try {
+          if (op.equals("register")) {
+            need(ids("u.", ".role").size() < 500, "Demo user capacity reached");
+            need(!state.containsKey("u." + u + ".role"), "Username already registered");
+            String password = required(p, "password");
+            passwordValid(password);
+            String r = required(p, "role");
+            need(ROLES.contains(r) && !r.equals("ADMIN"), "Invalid registration role");
+            createUser(u, password, r, r.equals("CITIZEN"));
+            revision++;
+            state.setProperty("revision", String.valueOf(revision));
+            save();
+            notifyAll();
+            return props(
+                "ok",
+                "true",
+                "message",
+                r.equals("CITIZEN")
+                    ? "Registered. You can now log in."
+                    : "Registered. Ask administrator to approve your account.");
+          }
+          String salt =
+              state.getProperty(
+                  "u." + u + ".salt", Base64.getEncoder().encodeToString(new byte[16]));
+          String hash = hashPassword(required(p, "password"), salt);
+          if (!MessageDigest.isEqual(
+              hash.getBytes(StandardCharsets.UTF_8),
+              state.getProperty("u." + u + ".password", "").getBytes(StandardCharsets.UTF_8)))
+            throw new Bad(401, "Invalid username or password");
+          if (!Boolean.parseBoolean(state.getProperty("u." + u + ".approved")))
+            throw new Bad(403, "Account awaiting administrator approval");
+          long now = System.currentTimeMillis();
+          for (String sid : ids("s.", ".user"))
+            if (Long.parseLong(state.getProperty("s." + sid + ".expires", "0")) < now) {
+              state.remove("s." + sid + ".user");
+              state.remove("s." + sid + ".expires");
+            }
+          String token = secret(), base = "s." + digest(token) + ".";
+          state.setProperty(base + "user", u);
+          state.setProperty(base + "expires", String.valueOf(now + 7L * 24 * 60 * 60 * 1000));
+          save();
+          return props("ok", "true", "token", token, "user", u, "role", role(u));
+        } catch (Exception e) {
+          state.clear();
+          state.putAll(before);
+          revision = oldRevision;
+          throw e;
+        }
+      }
+    }
+    String u = authenticate(p);
+    if (op.equals("poll")) {
+      if (!polls.tryAcquire()) throw new Bad(429, "Too many live connections");
+      try {
+        long after;
+        try {
+          after = Long.parseLong(p.getProperty("after", "-1"));
+        } catch (Exception e) {
+          throw new Bad(400, "Invalid revision");
+        }
+        synchronized (this) {
+          long deadline = System.currentTimeMillis() + 20000;
+          while (!closed && revision == after && System.currentTimeMillis() < deadline)
+            wait(Math.max(1, deadline - System.currentTimeMillis()));
+          authenticate(p);
+          return snapshot(u);
+        }
+      } finally {
+        polls.release();
+      }
+    }
+    synchronized (this) {
+      switch (op) {
+        case "snapshot":
+          return snapshot(u);
+        case "photo":
+          String id = required(p, "id");
+          incidentAccess(u, id);
+          return props("ok", "true", "photo", state.getProperty("i." + id + ".photo", ""));
+        case "logout":
+          String b = "s." + digest(required(p, "token")) + ".";
+          Properties before = (Properties) state.clone();
+          state.remove(b + "user");
+          state.remove(b + "expires");
+          try {
+            save();
+          } catch (IOException e) {
+            state.clear();
+            state.putAll(before);
+            throw e;
+          }
+          notifyAll();
+          return props("ok", "true");
+        default:
+          return mutate(u, p);
+      }
+    }
+  }
+
+  private void handle(HttpExchange e) throws IOException {
+    try {
+      if (!e.getRequestURI().getPath().equals("/api")) throw new Bad(404, "Unknown path");
+      if (!e.getRequestMethod().equals("POST")) throw new Bad(405, "POST required");
+      byte[] bytes = e.getRequestBody().readNBytes(800001);
+      if (bytes.length > 800000) throw new Bad(413, "Request too large");
+      Properties p = new Properties();
+      String body = new String(bytes, StandardCharsets.UTF_8);
+      for (String pair : body.split("&")) {
+        String[] kv = pair.split("=", 2);
+        if (kv.length == 2) {
+          String key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
+          need(!p.containsKey(key), "Duplicate field");
+          p.setProperty(key, URLDecoder.decode(kv[1], StandardCharsets.UTF_8));
+        }
+      }
+      respond(e, 200, request(p, e.getRemoteAddress().getAddress().getHostAddress()));
+    } catch (Bad b) {
+      respond(e, b.code, props("error", b.getMessage()));
+    } catch (IllegalArgumentException ex) {
+      respond(e, 400, props("error", "Invalid request encoding"));
+    } catch (Exception ex) {
+      System.err.println("Request failed: " + ex.getClass().getSimpleName());
+      respond(e, 500, props("error", "Server could not complete request; retry safely"));
+    }
+  }
+
+  private static void respond(HttpExchange e, int status, Properties p) throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    p.store(out, null);
+    byte[] b = out.toByteArray();
+    e.getResponseHeaders().set("Content-Type", "text/plain; charset=ISO-8859-1");
+    e.getResponseHeaders().set("Cache-Control", "no-store");
+    e.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+    e.sendResponseHeaders(status, b.length);
+    try (OutputStream stream = e.getResponseBody()) {
+      stream.write(b);
+    } finally {
+      e.close();
+    }
+  }
+
+  public static void main(String[] args) throws Exception {
+    String password = System.getenv("RESCUELINK_ADMIN_PASSWORD");
+    Path folder = Path.of(args.length > 0 ? args[0] : "data");
+    int port = args.length > 1 ? Integer.parseInt(args[1]) : 8080;
+    String host = args.length > 2 ? args[2] : "127.0.0.1";
+    Server server = new Server(folder, host, port, password);
+    Runtime.getRuntime().addShutdownHook(new Thread(server::close));
+    server.start();
+    System.out.println(
+        "RescueLink backend http://"
+            + host
+            + ":"
+            + server.port()
+            + " (use HTTPS tunnel for internet)");
+  }
 }
