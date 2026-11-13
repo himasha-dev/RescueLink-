@@ -426,4 +426,191 @@ public class MainActivity extends Activity {
         });
   }
 
+  private void map(boolean readOnly, double lat, double lon) {
+    Intent i =
+        new Intent(this, MapActivity.class)
+            .putExtra("lat", lat)
+            .putExtra("lon", lon)
+            .putExtra("readonly", readOnly)
+            .putExtra("id", readOnly ? selectedId : "");
+    if (readOnly) startActivity(i);
+    else startActivityForResult(i, 201);
+  }
+
+  private void reportScreen() {
+    screen = "report";
+    shell("Create emergency report");
+    button(body, "Back to dashboard", this::home);
+    Spinner type = spinner(body, "Medical", "Accident", "Fire", "Flood", "Other");
+    Spinner severity = spinner(body, "LOW", "MEDIUM", "HIGH", "CRITICAL");
+    severity.setSelection(2);
+    EditText description = edit(body, "Describe what happened");
+    description.setSingleLine(false);
+    description.setMinLines(3);
+    locationLabel =
+        text(
+            body,
+            locationSelected
+                ? "Selected: " + selectedLat + ", " + selectedLon
+                : "Location not selected",
+            15);
+    button(body, "Select location on map", () -> map(false, selectedLat, selectedLon));
+    photoLabel = text(body, photo.isEmpty() ? "No photo attached" : "Photo attached", 14);
+    button(
+        body,
+        "Attach photo",
+        () -> {
+          Intent i =
+              new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  .setType("image/*")
+                  .addCategory(Intent.CATEGORY_OPENABLE);
+          startActivityForResult(i, 202);
+        });
+    button(
+        body,
+        "Remove photo",
+        () -> {
+          photo = "";
+          photoLabel.setText("No photo attached");
+        });
+    button(
+        body,
+        "Send report",
+        () -> {
+          if (value(description).isEmpty()) {
+            message("Add a description, or use SOS on the dashboard");
+            return;
+          }
+          queueReport(choice(type), choice(severity), value(description), false, photo);
+        });
+  }
+
+  private void queueReport(
+      String type, String severity, String description, boolean sos, String attachment) {
+    if (!locationSelected) {
+      message("Select an emergency location on the map first");
+      map(false, selectedLat, selectedLon);
+      return;
+    }
+    Session s = session;
+    Properties p =
+        Api.fields(
+            "op",
+            "report",
+            "request",
+            UUID.randomUUID().toString(),
+            "type",
+            type,
+            "severity",
+            severity,
+            "description",
+            description,
+            "sos",
+            String.valueOf(sos),
+            "lat",
+            String.valueOf(selectedLat),
+            "lon",
+            String.valueOf(selectedLon));
+    if (!attachment.isEmpty()) p.setProperty("photo", attachment);
+    background(
+        () -> {
+          Outbox.enqueue(this, s, p);
+          runOnUiThread(
+              () -> {
+                photo = "";
+                message("Saved locally — NOT delivered until server receipt arrives");
+                home();
+                connect();
+              });
+        });
+  }
+
+  private void outboxScreen() {
+    screen = "outbox";
+    shell("Delivery outbox");
+    button(body, "Back", this::home);
+    text(
+        body,
+        "A server receipt is separate from dispatcher acknowledgement. This list includes only this"
+            + " account and server.",
+        14);
+    try {
+      JSONArray q = Outbox.read(this);
+      int count = 0;
+      for (int n = q.length() - 1; n >= 0; n--) {
+        JSONObject o = q.getJSONObject(n);
+        if (!o.getString("account").equals(session.account())) continue;
+        count++;
+        JSONObject f = o.getJSONObject("fields");
+        String request = f.getString("request");
+        text(
+            body,
+            f.getString("type") + " • " + o.getString("status") + "\n" + o.optString("id", ""),
+            15);
+        if (!o.optString("id", "").isEmpty()) {
+          String id = o.getString("id");
+          button(body, "Open incident", () -> detail(id));
+        }
+        button(
+            body,
+            o.getString("status").equals("NOT DELIVERED")
+                ? "Cancel pending report"
+                : "Remove local receipt",
+            () ->
+                new AlertDialog.Builder(this)
+                    .setTitle("Remove this local entry?")
+                    .setMessage(
+                        "If sending is already in progress, removal cannot retract a report"
+                            + " received by the server.")
+                    .setPositiveButton(
+                        "Remove",
+                        (d, w) -> {
+                          try {
+                            Outbox.delete(this, request);
+                            outboxScreen();
+                          } catch (Exception e) {
+                            error(e);
+                          }
+                        })
+                    .setNegativeButton("Keep", null)
+                    .show());
+      }
+      if (count == 0) text(body, "No queued reports", 16);
+    } catch (Exception e) {
+      error(e);
+    }
+    button(body, "Refresh delivery status", this::outboxScreen);
+  }
+
+  private void mutation(String op, String... fields) {
+    Session s = session;
+    Properties p = s.request(op);
+    p.setProperty("request", UUID.randomUUID().toString());
+    p.putAll(Api.fields(fields));
+    performMutation(s, p);
+  }
+
+  private void performMutation(Session s, Properties p) {
+    background(
+        () -> {
+          try {
+            Api.call(s.url, p);
+            runOnUiThread(() -> message("Server confirmed action"));
+          } catch (IOException e) {
+            runOnUiThread(
+                () ->
+                    new AlertDialog.Builder(this)
+                        .setTitle("Action not confirmed")
+                        .setMessage(
+                            e.getMessage()
+                                + "\n"
+                                + "Retry safely with the same request ID? Check the live state"
+                                + " first.")
+                        .setPositiveButton("Retry", (d, w) -> performMutation(s, p))
+                        .setNegativeButton("Close", null)
+                        .show());
+          }
+        });
+  }
+
 }
